@@ -3,113 +3,141 @@ import mongoose from "mongoose";
 import cors from "cors";
 import dotenv from "dotenv";
 import multer from "multer";
-import path from "path";
-import fs from "fs";
+import { supabase } from "./supabaseClient.js";
 
 dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Serve uploaded files
-app.use("/uploads", express.static("uploads"));
+// ✅ Debug env values (just first few chars, so you know it's loaded)
+console.log("Supabase bucket:", process.env.SUPABASE_BUCKET);
+console.log("Supabase URL:", process.env.NEXT_PUBLIC_SUPABASE_URL);
+console.log("Mongo URI present:", !!process.env.MONGO_URI);
 
 // MongoDB connect
 mongoose
-  .connect(process.env.MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-  })
-  .then(() => console.log("MongoDB Connected"))
-  .catch((err) => console.log(err));
+  .connect(process.env.MONGO_URI)
+  .then(() => console.log("✅ MongoDB Connected"))
+  .catch((err) => console.error("❌ MongoDB Error:", err));
 
 // Song Schema
 const songSchema = new mongoose.Schema({
   title: String,
   artist: String,
-  filePath: String,
   duration: Number,
+  url: String, // Supabase file URL
 });
-
 const Song = mongoose.model("Song", songSchema);
 
-// Multer setup (store mp3 files locally in uploads/)
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, "uploads/"),
-  filename: (req, file, cb) =>
-    cb(null, Date.now() + path.extname(file.originalname)),
-});
-const upload = multer({ storage });
+// Multer setup (memory storage for Supabase)
+const upload = multer({ storage: multer.memoryStorage() });
 
-// Routes
+// 📌 Get all songs
 app.get("/songs", async (req, res) => {
-  const songs = await Song.find();
-  res.json(songs);
-});
-
-app.post("/songs", upload.single("song"), async (req, res) => {
-  const { title, artist, duration } = req.body;
-  const newSong = new Song({
-    title,
-    artist,
-    duration,
-    filePath: `/uploads/${req.file.filename}`,
-  });
-  await newSong.save();
-  res.json(newSong);
-});
-
-//stream Route
-app.get("/stream/:id", async (req, res) => {
   try {
-    const song = await Song.findById(req.params.id);
-    if (!song) return res.status(404).send("Song not found");
-
-    const filePath = path.join(process.cwd(), song.filePath); // e.g., uploads/xxxx.mp3
-    const stat = fs.statSync(filePath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-
-    if (range) {
-      const parts = range.replace(/bytes=/, "").split("-");
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-
-      if (start >= fileSize) {
-        res
-          .status(416)
-          .send(
-            "Requested range not satisfiable\n" + start + " >= " + fileSize
-          );
-        return;
-      }
-
-      const chunksize = end - start + 1;
-      const file = fs.createReadStream(filePath, { start, end });
-      const head = {
-        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-        "Accept-Ranges": "bytes",
-        "Content-Length": chunksize,
-        "Content-Type": "audio/mpeg",
-      };
-      res.writeHead(206, head);
-      file.pipe(res);
-    } else {
-      const head = {
-        "Content-Length": fileSize,
-        "Content-Type": "audio/mpeg",
-      };
-      res.writeHead(200, head);
-      fs.createReadStream(filePath).pipe(res);
-    }
+    const songs = await Song.find();
+    res.json(songs);
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Server error");
+    console.error("❌ Fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch songs" });
+  }
+});
+
+// 📌 Upload a new song
+app.post("/songs", upload.single("song"), async (req, res) => {
+  try {
+    const { title, artist, duration } = req.body;
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    // Unique filename for Supabase
+    const filename = `${Date.now()}-${file.originalname}`;
+
+    console.log(
+      `📤 Uploading file: ${filename} to bucket: ${process.env.SUPABASE_BUCKET}`
+    );
+
+    // Upload to Supabase bucket
+    const { data: uploadedFile, error: uploadError } = await supabase.storage
+      .from(process.env.SUPABASE_BUCKET)
+      .upload(filename, file.buffer, {
+        contentType: file.mimetype,
+        upsert: true, // allow overwrite
+      });
+
+    if (uploadError) {
+      console.error("❌ Supabase upload error:", uploadError);
+      return res.status(500).json({
+        error: "Supabase upload failed",
+        details: uploadError.message,
+      });
+    }
+
+    console.log("✅ File uploaded to Supabase:", uploadedFile);
+
+    // Get public URL
+    const { data: publicData } = supabase.storage
+      .from(process.env.SUPABASE_BUCKET)
+      .getPublicUrl(filename);
+
+    console.log("🌍 Public URL:", publicData.publicUrl);
+
+    // Save song metadata in MongoDB
+    const newSong = new Song({
+      title,
+      artist,
+      duration,
+      url: publicData.publicUrl,
+    });
+
+    await newSong.save();
+    console.log("✅ Song metadata saved to MongoDB");
+
+    res.json(newSong);
+  } catch (err) {
+    console.error("❌ Upload route error:", err);
+    res.status(500).json({ error: "Upload failed", details: err.message });
+  }
+});
+
+//Delete uploaded song
+// 📌 Delete a song
+app.delete("/songs/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const song = await Song.findByIdAndDelete(id);
+
+    if (!song) {
+      return res.status(404).json({ error: "Song not found" });
+    }
+
+    // Delete song from Supabase bucket
+    const { error: deleteError } = await supabase.storage
+      .from(process.env.SUPABASE_BUCKET)
+      .remove([song.url.split("/").pop()]);
+
+    if (deleteError) {
+      console.error("❌ Supabase delete error:", deleteError);
+      return res.status(500).json({
+        error: "Supabase delete failed",
+        details: deleteError.message,
+      });
+    }
+
+    console.log("✅ Song deleted from Supabase bucket");
+    res.json({ message: "Song deleted successfully" });
+  } catch (err) {
+    console.error("❌ Delete route error:", err);
+    res.status(500).json({ error: "Delete failed", details: err.message });
   }
 });
 
 // Start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () =>
-  console.log(`Backend running on http://localhost:${PORT}`)
+  console.log(`🚀 Backend running on http://localhost:${PORT}`)
 );
